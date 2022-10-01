@@ -1,0 +1,641 @@
+---
+title: Predicting metabolite abundances through random forest regression using metagenome
+  representations
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Overview
+
+This document summarizes the transformations and scripts necessary to run this basic machine learning pipeline for predicting metabolite abundances. The aim is to train models to predict metabolite abundances using feature derived from metagenome data (e.g., microbial taxonomic and functional profiles obtained through sequencing). 
+
+In brief, the code loads and transforms two datasets containing human fecal samples from which microbial function and metabolite abundances have been obtained. Using one dataset as a training set, we will fit random forest regression models for metabolites that are shared between both datasets. Fitted models are then applied to the heldout dataset - the training set - to predict metabolite abundances. An additional round of training-predicting is performed, using the training set as the test set and vice versa, to produce a complete set of metabolite predictions for all samples. The quality of those predictions are evaluated using some basic metrics.
+
+This pipeline was loosely inspired by the machine learning tool *MelonnPan* (H. Mallick, 2019. *Nature*), which similarly uses microbiome sequencing features to predict metabolite levels. Am important distinction between that pipeline and the one described in this document is that *MelonnPan* utilizes regularized linear regression, whereas we will be using random forest regression.
+
+A robust, in silico method for predicting metabolite abundances could help researchers generate  biologically meaningful hypotheses regarding interactions shared between the human microbiome and the metabolome. Such a method could expedite the costly process of generating metabolite data through analytical instrumentation (e.g., mass spectrometry, NMR) by first narrowing the potential range of metabolites to be monitored. Older datasets for which only sequencing data is available and no sample remains for metabolic profiling could also be recycled for further study.
+
+
+
+#### Loading libraries
+
+```{r, message = FALSE}
+library(tidyverse) #v1.3.1 Collection of packages for data wrangling and visualization
+library(tidymodels) #v1.0.0 Machine learning packages
+library(httr) #v1.4.4 To query MetaboAnalyst's metabolite mapping service
+library(jsonlite) #v1.8.0 Parsing outputs from MetaboAnalyst
+load('data/data_scripts.RData')
+```
+
+
+
+## Metabolite data
+
+We will use two publicly-available datasets processed at the Broad Institute. We will abbreviate them as *lloyd* and *franzosa* respectively. You can find them here if you wish to read up on the cohorts used to generate these data:
+
+Lloyd-Price, J., Arze, C., Ananthakrishnan, A.N. *et al*. Multi-omics of the gut microbial ecosystem in inflammatory bowel diseases. *Nature* **569**, 655–662 (2019). 
+
+Franzosa, E.A., Sirota-Madi, A., Avila-Pacheco, J. *et al*. Gut microbiome structure and metabolic activity in inflammatory bowel disease. **4(2)**, 293-305 (2018).
+
+A key caveat to note: both cohorts concern subjects with inflammatory bowel disease. At this point, we do not plan to stratify our pipeline by case-controls, and it is not yet known how disease activity alters those associations between microbes and metabolites which our pipeline is attempting to learn.
+
+
+
+#### Downloading files
+
+Note that there is an outdated version of *franzosa_metab_key.xlsx* being hosted on NCBI. If you wish to download the file straight off the website, download the one hosted on Nature, not NCBI.
+
+```{r, message = FALSE, cache = TRUE}
+# Downloading franzosa metabolite abundances
+if (!file.exists('raw_data/franzosa_metab.xlsx')) {
+        url <- 'https://static-content.springer.com/esm/art%3A10.1038%2Fs41564-018-0306-4/MediaObjects/41564_2018_306_MOESM4_ESM.xlsx'
+        download.file(url,
+                      'raw_data/franzosa_metab.xlsx',
+                      mode = 'wb')
+}
+
+# Downloading franzosa metabolite key
+if (!file.exists('raw_data/franzosa_metab_key.xlsx')) {
+        url <- 'https://static-content.springer.com/esm/art%3A10.1038%2Fs41564-018-0306-4/MediaObjects/41564_2018_306_MOESM3_ESM.xlsx'
+        download.file(url, 
+                      'raw_data/franzosa_metab_key.xlsx',
+                      mode = 'wb')
+}
+
+# Downloading lloyd metabolite abundances
+if(!file.exists('raw_data/lloydprice_metab.gz')) {
+        url <- 'https://ibdmdb.org/tunnel/products/HMP2/Metabolites/1723/HMP2_metabolomics.csv.gz'
+        download.file(url, 
+                      'raw_data/lloydprice_metab.gz')
+}
+```
+
+
+
+#### Data wrangling for metabolites
+
+We will discard all metabolites and chemical features that have not been annotated with an ID from the HMDB, an online catalogue for human metabolites. This will narrow the range of chemical features in our analysis considerably which should improve our computation time. Duplicate metabolites - a consequence of overlapping metabolite coverage across multiple metabolomic instrumentation protocols - will also be discarded.
+
+```{r, message = FALSE, cache = TRUE, warning = FALSE}
+# Loading in lloyd metabolite dataset
+lloyd_metab <- 
+        read_csv(file = gzfile('raw_data/lloydprice_metab.csv.gz'),
+                 name_repair = 'universal') %>%
+        # Removing redundant features and any metabolites without matching HMDB IDs
+        filter(!is.na(HMDB...Representative.ID.) & HMDB...Representative.ID. != 'redundant ion') %>%
+        # Removing superfluous columns
+        select(-c(1:4, 6:7)) #Removing all columns except sample and HMDB ID columns
+
+# Fixing formatting issues
+lloyd_metab$HMDB...Representative.ID. <- 
+        lloyd_metab$HMDB...Representative.ID. %>%
+        gsub(pattern = '\\*', 
+             replacement = '') %>%
+        gsub(pattern = 'HMDB', 
+             replacement = 'HMDB00')
+
+# Transposing lloyd_metab such that samples are arranged by row
+lloyd_metab <- 
+        setNames(data.frame(t(lloyd_metab[, -1])), 
+                        pull(lloyd_metab, 1)) %>%
+        rownames_to_column(var = 'ID') %>%
+        # Removing duplicate metabolites
+        select(-matches('\\.[1-9]+$')) 
+
+```
+
+The metabolite data for *franzosa* is formatted differently, most notably the authors have not given their metabolites a matching HMDB ID. The chemical features (unannotated molecular features identified by the metabolomics instrumentation) have also been separated from their annotated chemical names. We must re-match these features with their annotations.
+
+```{r, message = FALSE, cache = TRUE}
+# Loading in key for metabolites
+franzosa_metab_key <- 
+        readxl::read_excel(path = 'raw_data/franzosa_metab_key.xlsx',
+                           sheet = 1,
+                           skip = 1) %>%
+        select(c(1,6)) %>%
+        setNames(c('..Feature...Sample', 'Metabolite')) %>%
+        # Removing unnanotated metabolites
+        na.omit()
+
+# Loading in franzosa metabolite dataset
+franzosa_metab <-
+        readxl::read_excel(path = 'raw_data/franzosa_metab.xlsx',
+                           sheet = 1,
+                           skip = 1,
+                           .name_repair = 'universal') %>%
+        # Removing rows containing subject metadata
+        slice(-c(1:7)) %>%
+        type_convert() %>%
+        inner_join(x = franzosa_metab_key, by = '..Feature...Sample') %>%
+        select(-'..Feature...Sample')
+```
+
+We can use MetaboAnalyst's compound name mapping service to generate HMDB IDs for any matching metabolites. 
+
+```{r, message = FALSE, cache = TRUE}
+# Assembling names to be queried
+franzosa_metab_names <- c(franzosa_metab$Metabolite)
+payload <- 
+        list(queryList = franzosa_metab_names, 
+                inputType = 'name')
+
+# Submitting form to MetaboAnalyst
+url <- 'http://api.xialab.ca/mapcompounds'
+query_results <- 
+        httr::POST(url, 
+                   body = payload, 
+                   encode = 'json')
+
+# Retrieving matches
+query_results_text <- 
+        content(query_results, 
+                "text", 
+                encoding = "UTF-8")
+query_results_json <- 
+        jsonlite::fromJSON(query_results_text, 
+                           flatten = TRUE)
+query_results_table <- t(rbind.data.frame(query_results_json))
+query_results_table[query_results_table == 'NA'] <- NA
+
+#Matching HMDB IDs to metabolite names
+franzosa_metab <-
+        franzosa_metab %>%
+        mutate(HMDB_ID = query_results_table[3, ]) %>%
+        select(-Metabolite) %>%
+        # Removing metabolites without matching HMDB IDs
+        filter(!is.na(HMDB_ID)) 
+```
+
+Another thing to note: the samples in *franzosa_metab* have been given a different ID compared to the IDs attached to their sequencing data. The authors were kind enough to send us a key to harmonize these IDs.
+
+```{r, message = FALSE, cache = TRUE, warning = FALSE}
+# Loading in key for sample IDs
+franzosa_sample_key <- read_tsv(file = 'raw_data/franzosa_sample_key.txt')
+
+franzosa_metab <- 
+        setNames(data.frame(t(franzosa_metab[, -ncol(franzosa_metab)])), 
+                 pull(franzosa_metab, HMDB_ID)) %>%
+        rownames_to_column(var = 'Cohort_ID') %>%
+        mutate(Cohort_ID = sub(pattern = 'Validation\\.',
+                               replacement = '', Cohort_ID)) %>%
+        mutate(Cohort_ID = sub(pattern = '\\.',
+                               replacement = '_', Cohort_ID)) %>%
+        inner_join(franzosa_sample_key[-3]) %>% 
+        select(-c(Cohort_ID,
+                  # Removing duplicate metabolites
+                  matches('\\.[1-9]+$'))) %>% 
+        relocate(ID)
+```
+
+
+
+#### Assembling metabolite datasets together
+
+We will combine both metabolite datasets into a single list as input for our machine learning pipeline. To speed up the computation time, we will only be considering the common set of metabolites that are shared between both cohorts. We will also standardize these data by imputing missing metabolite abundances by a quarter of the minimum value identified for that metabolite. We will take the generalized logarithm (B. P. Durbin, 2002. *Bioinformatics*) of all abundance values before converting them to zero-mean unit-variance scores (i.e., z-scores).
+
+```{r, message = FALSE, cache = TRUE}
+# Subsetting metabolite data to common set of metabolites
+common_names <- 
+        intersect(names(franzosa_metab),
+                         names(lloyd_metab))
+franzosa_metab <-
+        franzosa_metab %>%
+        select(contains(common_names))
+lloyd_metab <- 
+        lloyd_metab %>%
+        select(contains(common_names))
+
+# Combining metabolite data into a single list
+metab_dat <- 
+        list(franzosa = franzosa_metab,
+             lloyd = lloyd_metab) %>%
+        # Imputing missing values, taking generalized log, outputting standard scores
+        lapply(function(x) log_autoscale(x, 
+                                         impute = TRUE,
+                                         glog = TRUE,
+                                         ID_index = 1))
+
+# Removing intermediary files
+rm(franzosa_metab_key, franzosa_metab_names, 
+   payload, url, query_results, query_results_text, query_results_json, query_results_table,
+   common_names, franzosa_metab, lloyd_metab)
+```
+
+
+
+## Metagenome data
+
+The metagenome comprises all the genetic material recovered from an environmental sample. This would include microbial DNA, using which we can uncover the microbial taxa that inhabit the environment and the genes they encode to perform the metabolite transformations necessary to sustain life. For this pipeline, we are primarily interested in the associations between microbial functions and metabolites.
+
+I generated these functional profiles from raw sequences acquired from the same papers listed in the previous section using the HUMAnN2 pipeline (E. A. Franzosa, 2018. *Nature Methods*). There are many different ways to catalogue gene functions - these profiles have been catalogued using the Kyoto Encyclopedia of Genes and Genomes (KEGG) orthology system to generate KEGG orthologs (KOs).
+
+It is good practice to normalize taxonomic or functional abundances to better account for artifactual sources of variation arising from unwanted effects that are not relevant to the experiment (e.g., slight differences in how the DNA was extracted and stored, whether the samples were sequenced in a single or multiple batches). We will transform these abundances into relative abundances and apply a filter to eliminate low abundance-low prevalence KOs.
+
+```{r, message = FALSE, cache = TRUE}
+# Loading in franzosa functional data
+franzosa_ko <- 
+        read_tsv(file = 'raw_data/franzosa_KO.tsv') %>%
+        data.table::transpose(keep.names = 'ID',
+                              make.names = 1) 
+
+# Loading in lloyd functional data
+lloyd_ko <- 
+        read_tsv(file = 'raw_data/lloyd_KO.tsv') %>%
+        data.table::transpose(keep.names = 'ID',
+                              make.names = 1)
+
+# Combining functional data into a single list
+ko_dat <- 
+        list(franzosa = franzosa_ko, 
+             lloyd = lloyd_ko) %>%
+        # Converting raw abundances to relative abundances
+        lapply(function(x) relative_abundance(x,
+                                              ID_index = 1)) %>%
+        lapply(function(x) abundance_filter(x,
+                                            ID_index = 1,
+                                            # More stringent filtering will help speed up
+                                            # computation time by eliminating predictors
+                                            sample_threshold = 0.001,
+                                            renormalize = TRUE))
+
+# Removing intermediary files
+rm(franzosa_ko, lloyd_ko)
+```
+
+
+
+## Running the machine learning pipeline
+
+Now that we have assembled our metabolite and functional data together, we can run our machine learning pipeline to tune, fit random forest regression models for every metabolite, before using those models to predict their abundances. As we have two datasets (i.e., *franzosa* and *lloyd*), one will be used as the training set whilst the other serves as the test set - this process will be repeated once more such that we have a full set of metabolite predictions for both datasets.
+
+
+
+#### Subsetting data
+
+You may have noticed that the sample IDs across *metab_dat* and *ko_dat* are not the same for *franzosa* and *lloyd*. In both studies, only a subset of each cohort was selected to have their samples profiled for metabolites whereas all samples were metagenome sequenced. We will subset our datasets such that we are only considering the samples that were both sequenced and metabolically profiled.
+
+```{r, message = FALSE, cache = TRUE}
+# Matching samples between metabolite and functional data
+samples <- 
+        match_samples(ko_dat,
+                      metab_dat)
+
+# Removing unmatched samples
+ko_dat[['franzosa']] <- 
+        ko_dat[['franzosa']][match(samples[['franzosa']], ko_dat[['franzosa']][[1]]),]
+ko_dat[['lloyd']] <- 
+        ko_dat[['lloyd']][match(samples[['lloyd']], ko_dat[['lloyd']][[1]]),]
+metab_dat[['franzosa']] <- 
+        metab_dat[['franzosa']][match(samples[['franzosa']], metab_dat[['franzosa']][[1]]),]
+metab_dat[['lloyd']] <- 
+        metab_dat[['lloyd']][match(samples[['lloyd']], metab_dat[['lloyd']][[1]]),]
+
+```
+
+
+
+#### Generating null data
+
+We will also create null data - data that have been randomly permuted - and run this through the same pipeline as a sanity check. This will help us determine whether our pipeline is picking up genuine biological signals in our data, or whether it is training itself on random, unwanted noise.
+
+```{r, message = FALSE, cache = TRUE}
+# Setting seed such that sampling is reproducible
+set.seed(123)
+
+# Creating null data
+null_metab <- 
+        lapply(metab_dat, sample) %>%
+        lapply(relocate, ID) %>%
+        lapply(setNames, lapply(metab_dat, colnames)[[1]])
+null_ko <- 
+        lapply(ko_dat, sample) %>%
+        lapply(relocate, ID)
+```
+
+
+
+#### Random forest function
+
+We can now generate our predictions for both the data and the null data. Note that, with tuning, this took my home computer well over 72 hours to complete. I've included the code chunk here if you'd like to run it on your own, but it will not evaluate inside this document.
+
+```{r, eval = FALSE}
+# Predicting metabolites
+pred <- 
+        rf_fit_predict(metab_dat, 
+                       ko_dat)
+
+# Null predictions
+null_pred <- 
+        rf_fit_predict(null_metab, 
+                       null_ko)
+```
+
+This chunk will load the processed predictions into your environment.
+
+```{r, message = FALSE}
+load('data/final_prediction.Rdata')
+
+# Removing intermediary files
+rm(ko_dat, samples,
+   null_metab, null_ko)
+```
+
+
+
+## Evaluating pipeline performance
+
+#### Spearman's correlations between observed and predicted metabolite
+
+There are a variety of ways we can evaluate how well our pipeline has performed. Let's start by looking at how well our predictions correlate with the experimentally observed values. We can do this in two ways: we can look at the Spearman's correlations between each metabolite's predicted and observed abundance, and we can look at the Spearman's correlations between each sample's predicted sample metabolome (i.e., the complete set of abundances for all the metabolites found in a sample) and its observed sample metabolome.
+
+```{r, message = FALSE, cache = TRUE}
+# Calculating metabolite correlations
+metab_cor <- 
+        diag(cor(x = bind_rows(pred$lloyd[-1], 
+                                    pred$franzosa[-1]), 
+                      y = bind_rows(metab_dat$lloyd[-1], 
+                                    metab_dat$franzosa[-1])))
+
+nullmetab_cor <- 
+        diag(cor(x = bind_rows(null_pred$lloyd[-1], 
+                                        null_pred$franzosa[-1]), 
+                          y = bind_rows(metab_dat$lloyd[-1], 
+                                        metab_dat$franzosa[-1])))
+
+# Calculating sample correlations
+samp_cor <- 
+        diag(cor(x = t(bind_rows(pred$lloyd[-1], 
+                                     pred$franzosa[-1])),
+                     y = t(bind_rows(metab_dat$lloyd[-1], 
+                                     metab_dat$franzosa[-1]))))
+
+nullsamp_cor <- 
+        diag(cor(x = t(bind_rows(null_pred$lloyd[-1], 
+                                         null_pred$franzosa[-1])),
+                         y = t(bind_rows(metab_dat$lloyd[-1], 
+                                         metab_dat$franzosa[-1]))))
+
+# Plotting Spearman's correlations for metabolites
+data.frame(Prediction = metab_cor,
+           Null = nullmetab_cor) %>%
+        pivot_longer(cols = everything()) %>%
+        mutate(name = factor(name,
+                             levels = c('Prediction',
+                                        'Null'))) %>%
+        ggplot(aes(x = value,
+                   fill = name)) +
+        geom_histogram(position = 'identity',
+                       alpha = 0.5,
+                       bins = 50) +
+        labs(x = 'Spearmans correlation') +
+        ggtitle('Metabolite Correlations') +
+        scale_fill_discrete(name = NULL) +
+        theme_bw()
+
+# Plotting Spearman's correlations for sample metabolomes
+data.frame(Prediction = samp_cor,
+           Null = nullsamp_cor) %>%
+        pivot_longer(cols = everything()) %>%
+        mutate(name = factor(name,
+                             levels = c('Prediction',
+                                        'Null'))) %>%
+        ggplot(aes(x = value,
+                   fill = name)) +
+        geom_histogram(position = 'identity',
+                       alpha = 0.5,
+                       bins = 50) +
+        labs(x = 'Spearmans correlation') +
+        ggtitle('Sample Metabolome Correlations') +
+        scale_fill_discrete(name = NULL) +
+        theme_bw()
+```
+
+It looks as if there is a signal, though it doesn't look much stronger than the null set. The correlations between the predicted and observed metabolite abundances seem to be more convincing than the sample metabolome correlations (which look as if they are centered around zero). We will have a closer look at the four best correlated metabolites in these data.
+
+```{r, message = FALSE, cache = TRUE}
+# Identifying best correlated metabolites
+best_metabs <- 
+        diag(cor(x = bind_rows(pred$lloyd[-1], 
+                                      pred$franzosa[-1]), 
+                        y = bind_rows(metab_dat$lloyd[-1], 
+                                      metab_dat$franzosa[-1]),
+                        method = 'spearman')) %>%
+        sort(decreasing = TRUE) %>%
+        head(n = 4)
+
+# Spearman's correlations between predicted and observed metabolite abundances
+print(best_metabs)
+best_metabs <-
+        best_metabs %>%
+        names()
+
+# Plotting best correlated metabolites
+for (i in 1:length(best_metabs)) {
+        assign(paste('p', i, sep = ''),
+               data.frame(bind_rows(pred$lloyd, 
+                                    pred$franzosa) %>%
+                                  select(contains(best_metabs[i])),
+                          bind_rows(metab_dat$lloyd, 
+                                    metab_dat$franzosa) %>%
+                                  select(contains(best_metabs[i]))) %>%
+                       setNames(c('Predicted',
+                                  'Observed')) %>%
+                       mutate(Metabolite = best_metabs[i]))
+}
+bind_rows(p1, p2, p3, p4) %>%
+        ggplot(aes(x = Observed, 
+                   y = Predicted)) +
+        geom_point() +
+        geom_smooth(method = 'lm') +
+        facet_grid(~Metabolite) +
+        theme_bw()
+```
+
+Our four best correlated HMDB IDs: `r best_metabs`, correspond to the metabolites *cholate*, *chenodeoxycholate*, *N1,N12-Diacetylspermine*, and *phytosphingosine*. Cholate and chenodeoxycholate are both primary bile acids that are synthesized in the liver and undergo extensive biotransformation within the colon by resident microbes. 
+
+```{r}
+# Removing intermediary files
+rm(best_metabs, i,
+   metab_cor, nullmetab_cor, nullsamp_cor, samp_cor,
+   p1, p2, p3, p4)
+```
+
+
+
+#### Differential abundance analysis
+
+A key goal in many microbiome studies is to identify features that are more abundant in a disease population compared to a healthy population, the implication being that those features might play a role in the pathophysiology of that disease and thus could be potential therapeutic targets. To this end, researchers will typically perform a *differential abundance analysis* to identify features that are enriched or depleted in case versus control subjects.
+
+Both *franzosa* and *lloyd* involve case-control cohorts of subjects with inflammatory bowel disease. We will estimate how well the predictions from our pipeline recapture the differential abundance patterns within the experimentally observed metabolite data. We will begin by identifying differentially abundant metabolites in both *franzosa* and *lloyd*. To do so, we will need the case-control labels for each.
+
+```{r, message = FALSE, cache = TRUE, warning = FALSE}
+# Downloading lloyd sample key
+if (!file.exists('raw_data/lloyd_sample_key.csv')) {
+        url <- 'https://ibdmdb.org/tunnel/products/HMP2/Metadata/hmp2_metadata.csv'
+        download.file(url,
+                      'raw_data/lloyd_sample_key.csv',
+                      mode = 'wb')
+}
+
+# Loading in lloyd sample key
+lloyd_sample_key <- 
+        read_csv(file = 'raw_data/lloyd_sample_key.csv',
+                           name_repair = 'universal') %>%
+        # Removing samples that have not been metabolically profiled
+        filter(data_type == 'metabolomics') %>%
+        select(External.ID, diagnosis) %>%
+        # Collapsing subjects with CD and UC together
+        mutate(diagnosis = factor(gsub(pattern = 'CD|UC', 
+                                       replacement = 'IBD', 
+                                       diagnosis))) %>%
+        rename(ID = 1)
+
+# Collapsing subjects with CD and UC together for franzosa
+franzosa_sample_key <-
+        franzosa_sample_key %>%
+        mutate(Class = factor(gsub(pattern = 'CD|UC',
+                                   replacement = 'Case',
+                                   franzosa_sample_key$Class)))
+```
+
+There is metadata attached to these keys that can join to our metabolite data.
+
+```{r, message = FALSE, cache = TRUE}
+# Attaching case-control labels to observed, predicted, and null metabolite data for lloyd
+lloyd_test <- 
+        inner_join(metab_dat$lloyd, 
+                   lloyd_sample_key)
+lloyd_predtest <- 
+        inner_join(pred$lloyd, 
+                   lloyd_sample_key)
+lloyd_nulltest <- 
+        inner_join(null_pred$lloyd, 
+                   lloyd_sample_key)
+
+# Attaching case-control labels to observed, predicted, and null metabolite data for franzosa
+franzosa_test <- 
+        inner_join(metab_dat$franzosa, 
+                   franzosa_sample_key[-2])
+franzosa_predtest <- 
+        inner_join(pred$franzosa, 
+                   franzosa_sample_key[-2])
+franzosa_nulltest <- 
+        inner_join(null_pred$franzosa, 
+                   franzosa_sample_key[-2])
+```
+
+We will apply a simple t-test between cases and controls to identify differentially abundant metabolites. It is normally unnecessary to perform t-tests on z-scores but they are expedient and intuitive to understand and we can safely assume that our logged data is approximately normal anyways. We will also apply the strictest form of correction for testing multiple hypotheses (i.e., bonferroni correction).
+
+```{r, message = FALSE, cache = TRUE}
+# Identifying differentially abundant metabolites for lloyd
+lloyd_diff <- 
+        differential_abundance(lloyd_test, 
+                               ID_index = 1, 
+                               dep_index = ncol(lloyd_test),
+                               correction_method = 'bonferroni')
+lloyd_pred_diff <- 
+        differential_abundance(lloyd_predtest, 
+                               ID_index = 1, 
+                               dep_index = ncol(lloyd_predtest),
+                               correction_method = 'bonferroni')
+lloyd_null_diff <- 
+        differential_abundance(lloyd_nulltest, 
+                               ID_index = 1, 
+                               dep_index = ncol(lloyd_nulltest),
+                               correction_method = 'bonferroni')
+
+
+# Identifying differentially abundant metabolites for lloyd
+franzosa_diff <- 
+        differential_abundance(franzosa_test, 
+                               ID_index = 1, 
+                               dep_index = ncol(franzosa_test), 
+                               correction_method = 'bonferroni')
+franzosa_pred_diff <- 
+        differential_abundance(franzosa_predtest, 
+                               ID_index = 1, 
+                               dep_index = ncol(franzosa_predtest), 
+                               correction_method = 'bonferroni')
+franzosa_null_diff <- 
+        differential_abundance(franzosa_nulltest, 
+                               ID_index = 1, 
+                               dep_index = ncol(franzosa_nulltest), 
+                               correction_method = 'bonferroni')
+```
+
+Let us recap. We want to see whether the metabolites our pipeline predicts have the same differential abundance patterns as the ground-truth observed metabolite data. We have now identified differentially abundant metabolites in the **(A)** observed metabolite data, **(B)** the predicted metabolite data, **(C)** and the null metabolite data. If our pipeline works properly, we should expect there to be more overlaps between **(A)** and **(B)** compared to those between **(A)** and **(C)**.
+
+We can evaluate this by calculating F1 scores for both *franzosa* and *lloyd*. An F1 score estimates how accurate a method, it is defined as the harmonic mean between precision and recall. Scores approaching one are good - a score approaching zero and the method is poor.
+
+```{r, message = FALSE, cache = TRUE}
+# Preparing confusion matrix for lloyd
+lloyd_table <- 
+        data.frame(metabolites = colnames(metab_dat$lloyd)[-1],
+                         diff = as.factor(colnames(metab_dat$lloyd)[-1] %in% lloyd_diff),
+                         pred_diff = as.factor(colnames(metab_dat$lloyd)[-1] %in% lloyd_pred_diff),
+                         null_diff = as.factor(colnames(metab_dat$lloyd)[-1] %in% lloyd_null_diff))
+
+# Preparing confusion matrix for franzosa
+franzosa_table <- 
+        data.frame(metabolites = colnames(metab_dat$franzosa)[-1],
+                          diff = as.factor(colnames(metab_dat$franzosa)[-1] %in% franzosa_diff),
+                          pred_diff = as.factor(colnames(metab_dat$franzosa)[-1] %in% franzosa_pred_diff),
+                          null_diff = as.factor(colnames(metab_dat$franzosa)[-1] %in% franzosa_null_diff))
+
+# Calculating F1 scores for lloyd
+lloyd_predf1 <- 
+        lloyd_table %>%
+        conf_mat(truth = diff,
+                 # Estimate for predicted data
+                 estimate = pred_diff) %>%
+        summary() %>%
+        filter(.metric == 'f_meas')
+lloyd_nullf1 <- 
+        lloyd_table %>%
+        conf_mat(truth = diff,
+                 # Estimate for null data
+                 estimate = null_diff) %>%
+        summary() %>%
+        filter(.metric == 'f_meas')
+
+# Calculating F1 scores for franzosa
+franzosa_predf1 <- 
+        franzosa_table %>%
+        conf_mat(truth = diff,
+                 # Estimate for predicted data
+                 estimate = pred_diff) %>%
+        summary() %>%
+        filter(.metric == 'f_meas')
+
+franzosa_nullf1 <- 
+        franzosa_table %>%
+        conf_mat(truth = diff,
+                 # Estimate for null data
+                 estimate = null_diff) %>%
+        summary() %>%
+        filter(.metric == 'f_meas')
+
+# Plotting results
+data.frame(Prediction = c(lloyd_predf1$.estimate, 
+                          franzosa_predf1$.estimate),
+           Null = c(lloyd_nullf1$.estimate, 
+                    franzosa_nullf1$.estimate),
+           Cohort = c('lloyd', 
+                      'franzosa')) %>%
+        pivot_longer(cols = Prediction:Null, 
+                     values_to = 'F1') %>%
+        ggplot(aes(x = name, 
+                   y = F1, color = Cohort)) +
+        geom_point(size = 5) +
+        ggtitle('F1 Scores') +
+        theme(axis.title.x = element_blank()) +
+        scale_color_discrete(name = NULL) +
+        theme_bw()
+```
+
+Our pipeline, when trained using the appropriate data, outperforms the null data but not by all that much. We only have two data points here but it looks like there still is much we can do to optimize our prediction pipeline.
+
+```{r}
+sessionInfo()
+```
